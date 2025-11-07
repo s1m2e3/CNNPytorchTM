@@ -1,9 +1,10 @@
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Sequence
+from joblib import Parallel, delayed, effective_n_jobs
 import math
+import cv2
 
-@dataclass
 class KMeansColorQuantizer:
     """
     Simple K-Means(++) color quantizer for RGB images (no external deps).
@@ -16,19 +17,39 @@ class KMeansColorQuantizer:
         Maximum Lloyd iterations after K-Means++ initialization.
     tol : float
         Convergence tolerance on centroid movement (L2 norm).
+    max_pixels_for_fit : Optional[int]
+        If the number of pixels in the input image/batch exceeds this, a random sample of this size is used for fitting to save memory. If None, all pixels are used.
     random_state : Optional[int]
         Seed for reproducibility.
+    n_jobs : Optional[int]
+        Number of parallel jobs to run for fitting. -1 means using all available CPUs.
 
     Attributes (after fit)
     ----------------------
     centroids_ : (K, 3) float32
         RGB centroids in [0, 255] (if input is uint8) or input scale (if float).
     """
-    K: int
-    max_iters: int = 50
-    tol: float = 1e-3
-    random_state: Optional[int] = None
+    def __init__(self, K: int, max_iters: int = 50, tol: float = 1e-3,
+                 max_pixels_for_fit: Optional[int] = 1_000_000,
+                 random_state: Optional[int] = None, n_jobs: Optional[int] = -1,
+                 config: Optional[dict] = None):
+        self.K = K
+        self.max_iters = max_iters
+        self.tol = tol
+        self.max_pixels_for_fit = max_pixels_for_fit
+        self.random_state = random_state
+        self.n_jobs = n_jobs
+        self.centroids_: Optional[np.ndarray] = None
 
+        # Load centroids from the config dictionary if they are provided
+        if config and 'centroids' in config and config['centroids'] is not None:
+            print("KMeansColorQuantizer: Loading centroids from config.")
+            centroids_list = config['centroids']
+            self.centroids_ = np.array(centroids_list, dtype=np.float32)
+            # Verify shape
+            if self.centroids_.shape != (self.K, 3):
+                raise ValueError(f"Loaded centroids shape {self.centroids_.shape} does not match K={self.K}. Expected ({self.K}, 3).")
+                
     def fit(self, img: np.ndarray) -> "KMeansColorQuantizer":
         """
         Fit centroids to an RGB image.
@@ -42,16 +63,32 @@ class KMeansColorQuantizer:
         -------
         self
         """
+        if self.centroids_ is not None:
+            print("KMeans.fit: Centroids already loaded from config. Skipping fitting.")
+            return self
+            
+        print(f"KMeans.fit: Starting K-Means fitting with K={self.K}...")
         assert (img.ndim == 3 and img.shape[2] == 3) or \
                (img.ndim == 4 and img.shape[3] == 3), "img must be HxWx3 RGB or BxHxWx3 RGB."
         rng = np.random.default_rng(self.random_state)
 
-        X = img.reshape(-1, 3).astype(np.float32)  # (N,3)
+        # --- Memory-efficient sampling for large datasets ---
+        # Reshape to a 2D array of pixels (N_pixels, 3)
+        all_pixels = img.reshape(-1, 3)
+        N_total = all_pixels.shape[0]
+
+        if self.max_pixels_for_fit and N_total > self.max_pixels_for_fit:
+            print(f"KMeans: Input has {N_total:,} pixels, sampling {self.max_pixels_for_fit:,} for fitting.")
+            sample_indices = rng.choice(N_total, self.max_pixels_for_fit, replace=False)
+            X = all_pixels[sample_indices].astype(np.float32)
+        else:
+            X = all_pixels.astype(np.float32)
         N = X.shape[0]
         K = int(self.K)
         assert 1 <= K <= N, "K must be in [1, number of pixels]."
 
         # ---- K-Means++ initialization ----
+        print("KMeans.fit: Starting K-Means++ initialization...")
         # Choose first center uniformly
         idx0 = rng.integers(0, N)
         centers = [X[idx0]]
@@ -67,37 +104,27 @@ class KMeansColorQuantizer:
             new_d2 = np.sum((X - centers[-1])**2, axis=1)
             d2 = np.minimum(d2, new_d2)
 
+        print("KMeans.fit: K-Means++ initialization complete.")
         C = np.stack(centers, axis=0)  # (K,3)
 
         # ---- Lloyd's iterations ----
-        for _ in range(self.max_iters):
-            # Assignment step
-            # Compute squared distances to each centroid in a vectorized way
-            # dist2[i, k] = ||X[i] - C[k]||^2
-            dist2 = (
-                np.sum(X**2, axis=1, keepdims=True)
-                - 2 * (X @ C.T)
-                + np.sum(C**2, axis=1, keepdims=True).T
-            )
-            labels = np.argmin(dist2, axis=1)
-
-            # Update step
-            new_C = np.zeros_like(C)
-            counts = np.bincount(labels, minlength=K).astype(np.float32)
-            for k in range(K):
-                if counts[k] > 0:
-                    new_C[k] = X[labels == k].mean(axis=0)
-                else:
-                    # Re-seed empty cluster to a random point
-                    new_C[k] = X[rng.integers(0, N)]
+        print("KMeans.fit: Starting Lloyd's iterations...")
+        n_jobs = effective_n_jobs(self.n_jobs)
+        print(f"KMeans.fit: Using {n_jobs} parallel jobs for Lloyd's iterations.")
+        
+        for i in range(self.max_iters):
+            # Parallel E-step (assignment) and M-step (update)
+            new_C, counts = _kmeans_lloyd_iter_parallel(X, C, n_jobs)
 
             # Check convergence
             shift = np.linalg.norm(new_C - C)
             C = new_C
             if shift <= self.tol:
+                print(f"KMeans.fit: Converged after {i + 1} iterations.")
                 break
 
         self.centroids_ = C.astype(np.float32)
+        print(f"KMeans.fit: Fitting complete after {i + 1} iterations.")
         return self
 
     def predict(self, img_or_pixels: np.ndarray) -> np.ndarray:
@@ -113,6 +140,7 @@ class KMeansColorQuantizer:
         labels : (H,W), (B,H,W) or (N,) int
             Index of nearest centroid for each pixel.
         """
+        print("KMeans.predict: Starting prediction...")
         X, original_shape = _to_pixels(img_or_pixels)
         C = self.centroids_
         dist2 = (
@@ -122,12 +150,15 @@ class KMeansColorQuantizer:
         )
         labels = np.argmin(dist2, axis=1)
         
+        print("KMeans.predict: Prediction complete.")
         if len(original_shape) == 3: # (H,W,3) input
             return labels.reshape(original_shape[:2]) # (H,W)
         elif len(original_shape) == 4: # (B,H,W,3) input
             return labels.reshape(original_shape[:3]) # (B,H,W)
         else: # (N,3) input
             return labels # (N,)
+
+
 
     def transform(self, img: np.ndarray) -> np.ndarray:
         """
@@ -142,6 +173,7 @@ class KMeansColorQuantizer:
         qimg : (H,W,3) or (B,H,W,3) same dtype as input
             Image(s) with each pixel replaced by its centroid color.
         """
+        print("KMeans.transform: Starting color quantization...")
         labels = self.predict(img)
         C = self.centroids_
         
@@ -154,6 +186,7 @@ class KMeansColorQuantizer:
             q = np.clip(np.rint(q), 0, 255).astype(np.uint8)
         else:
             q = q.astype(img.dtype)
+        print("KMeans.transform: Color quantization complete.")
         return q
 
     def get_distances(self, img_or_pixels: np.ndarray) -> np.ndarray:
@@ -169,6 +202,7 @@ class KMeansColorQuantizer:
         distances : (H,W,K) or (B,H,W,K) or (N,K) float32 array
             Euclidean distance from each pixel to each of the K centroids.
         """
+        print("KMeans.get_distances: Starting distance calculation...")
         assert hasattr(self, "centroids_"), "KMeans must be fitted before calling get_distances."
         
         original_shape = img_or_pixels.shape
@@ -184,6 +218,7 @@ class KMeansColorQuantizer:
         # Take the square root for Euclidean distance
         distances = np.sqrt(np.maximum(dist2, 0)) # Use np.maximum to avoid sqrt of small negative numbers
 
+        print("KMeans.get_distances: Distance calculation complete.")
         return distances.reshape(*original_shape[:-1], self.K)
 
 def _to_pixels(arr: np.ndarray) -> Tuple[np.ndarray, Tuple[int, ...]]:
@@ -201,6 +236,52 @@ def _to_pixels(arr: np.ndarray) -> Tuple[np.ndarray, Tuple[int, ...]]:
     else:
         raise ValueError("Expected shape (H,W,3), (B,H,W,3) or (N,3).")
 
+
+# --------------------------
+# K-Means parallel helpers (top-level functions for joblib)
+# --------------------------
+def _lloyd_assignment_chunk(X_chunk: np.ndarray, C: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    E-step for a chunk of data. Computes labels and sufficient statistics for the M-step.
+    Returns labels for the chunk and the sum of points for each cluster.
+    """
+    K = C.shape[0]
+    # dist2[i, k] = ||X[i] - C[k]||^2
+    dist2 = (
+        np.sum(X_chunk**2, axis=1, keepdims=True)
+        - 2 * (X_chunk @ C.T)
+        + np.sum(C**2, axis=1, keepdims=True).T
+    )
+    labels_chunk = np.argmin(dist2, axis=1)
+    
+    # Calculate sufficient statistics (sum of points and counts per cluster) for this chunk
+    new_C_chunk = np.zeros_like(C, dtype=np.float64) # Use float64 for stable accumulation
+    counts_chunk = np.bincount(labels_chunk, minlength=K)
+    
+    for k in range(K):
+        if counts_chunk[k] > 0:
+            new_C_chunk[k] += X_chunk[labels_chunk == k].sum(axis=0)
+            
+    return new_C_chunk, counts_chunk
+
+def _kmeans_lloyd_iter_parallel(X: np.ndarray, C: np.ndarray, n_jobs: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Performs one parallel iteration of Lloyd's algorithm (E-step and M-step)."""
+    K = C.shape[0]
+    
+    # Parallel E-step and partial M-step
+    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(_lloyd_assignment_chunk)(X_chunk, C)
+        for X_chunk in np.array_split(X, n_jobs)
+    )
+
+    # Aggregate results from all chunks (M-step)
+    new_C_sum = np.sum([res[0] for res in results], axis=0)
+    total_counts = np.sum([res[1] for res in results], axis=0)
+
+    # Finalize new centroids
+    new_C = new_C_sum / np.maximum(total_counts[:, None], 1) # Avoid division by zero
+
+    return new_C, total_counts
 
 
 # --------------------------
@@ -267,43 +348,6 @@ def gabor_kernel2d(
 
 
 # --------------------------
-# Simple 2D convolution (NumPy, SAME padding)
-# --------------------------
-def conv2d_same(img: np.ndarray, ker: np.ndarray, padding: str = "reflect") -> np.ndarray:
-    """
-    img: HxW (single channel)
-    ker: khxkw
-    Returns SAME-sized result with chosen padding.
-    """
-    H, W = img.shape
-    kh, kw = ker.shape
-    ph, pw = (kh - 1) // 2, (kw - 1) // 2
-    if padding == "reflect":
-        pad_mode = "reflect"
-        # For very small H,W vs kernel, fallback to edge to avoid reflect errors
-        if H < kh or W < kw:
-            pad_mode = "edge"
-        padded = np.pad(img, ((ph, ph), (pw, pw)), mode=pad_mode)
-    elif padding == "constant":
-        padded = np.pad(img, ((ph, ph), (pw, pw)), mode="constant")
-    else:
-        raise ValueError("padding must be 'reflect' or 'constant'.")
-
-    # Flip kernel for convolution
-    kf = np.flipud(np.fliplr(ker))
-    out = np.zeros_like(img, dtype=np.float32)
-
-    # naive sliding (fine for prototyping; for speed use FFT or SciPy in practice)
-    for i in range(H):
-        ii = i + ph
-        for j in range(W):
-            jj = j + pw
-            patch = padded[ii - ph: ii + ph + 1, jj - pw: jj + pw + 1]
-            out[i, j] = np.sum(patch * kf, dtype=np.float32)
-    return out
-
-
-# --------------------------
 # Specs + Filter bank (NumPy)
 # --------------------------
 @dataclass
@@ -360,11 +404,15 @@ class ClassicFilterBankNP:
         per_channel: bool = True,
         dtype: np.dtype = np.float32,
         padding: str = "reflect",
+        batch_size: int = 32,
     ):
+        print("ClassicFilterBankNP.__init__: Initializing filter bank...")
         self.dtype = dtype
         self.per_channel = per_channel
         self.padding = padding
 
+
+        self.batch_size = batch_size
         # Build kernels
         self.G_kers: List[np.ndarray] = [gaussian_kernel2d(s.sigma, s.ksize, dtype=dtype) for s in gaussian_specs]
         self.L_kers: List[np.ndarray] = []
@@ -377,49 +425,101 @@ class ClassicFilterBankNP:
                                          for s in gabor_specs]
 
         self.nG, self.nL, self.nB = len(self.G_kers), len(self.L_kers), len(self.B_kers)
+        print(f"ClassicFilterBankNP.__init__: Built {self.nG} Gaussian, {self.nL} Laplacian, {self.nB} Gabor kernels.")
 
     def _ensure_chw(self, x: np.ndarray) -> Tuple[np.ndarray, int]:
-        """Return (x_chw, C) as float32; x_chw is (C,H,W)."""
-        assert x.ndim in (2, 3), "x must be (H,W) or (H,W,C)"
+        """Return (x_chw, C) as float32; x_chw is (C,H,W) or (B,C,H,W)."""
+        assert x.ndim in (2, 3, 4), "x must be (H,W), (H,W,C), or (B,H,W,C)"
         if x.ndim == 2:
-            x = x[:, :, None]
-        H, W, C = x.shape
+            x = x[None, :, :, None] # -> (1,H,W,1)
+        elif x.ndim == 3:
+            x = x[None, :, :, :] # -> (1,H,W,C)
+        
+        B, H, W, C = x.shape
+
         x = x.astype(self.dtype, copy=False)
         if not self.per_channel and C > 1:
             # convert to luminance-like by averaging channels
             x = np.mean(x, axis=2, keepdims=True)
             C = 1
         # to (C,H,W)
-        return np.transpose(x, (2, 0, 1)), C
+        return np.transpose(x, (0, 3, 1, 2)), C
 
     def _apply_family(self, x_chw: np.ndarray, kernels: List[np.ndarray]) -> np.ndarray:
-        """Apply list of kernels to (C,H,W) and concat along channel -> (H,W, len*k_out)."""
-        C, H, W = x_chw.shape
+        """Apply list of kernels to a single image (C,H,W) using OpenCV and concat results."""
+        C, H, W = x_chw.shape # (Channels, Height, Width)
         outs = []
+
+        # Map padding string to OpenCV's border types
+        border_map = {
+            "reflect": cv2.BORDER_REFLECT_101,
+            "constant": cv2.BORDER_CONSTANT,
+            "replicate": cv2.BORDER_REPLICATE,
+            "edge": cv2.BORDER_REPLICATE # Common fallback
+        }
+        border_type = border_map.get(self.padding, cv2.BORDER_REFLECT_101)
+
         for ker in kernels:
-            if self.per_channel:
-                # depthwise: one output per input channel
-                for c in range(C):
-                    outs.append(conv2d_same(x_chw[c], ker, padding=self.padding)[:, :, None])
-            else:
-                # shared filter on the (single) channel
-                outs.append(conv2d_same(x_chw[0], ker, padding=self.padding)[:, :, None])
+            # OpenCV's filter2D expects the image in (H, W, C) format.
+            # We can apply the same kernel to all channels at once if C > 1.
+            img_hwc = np.transpose(x_chw, (1, 2, 0)) # (H, W, C)
+            
+            # Apply convolution. -1 means output depth is same as input.
+            filtered_img = cv2.filter2D(img_hwc, -1, ker, borderType=border_type)
+            
+            # Ensure output is (H, W, C) even if input was (H, W)
+            if filtered_img.ndim == 2:
+                filtered_img = filtered_img[:, :, np.newaxis]
+            outs.append(filtered_img)
+
         if len(outs) == 0:
             return np.zeros((H, W, 0), dtype=self.dtype)
-        return np.concatenate(outs, axis=2)
+        
+        # Concatenate all filter responses along the channel axis
+        return np.concatenate(outs, axis=2).astype(self.dtype)
 
-    def forward(self, x: np.ndarray) -> Dict[str, np.ndarray]:
-        x_chw, C_out = self._ensure_chw(x)
-        G = self._apply_family(x_chw, self.G_kers)  # (H,W,nG*C_out)
-        L = self._apply_family(x_chw, self.L_kers)  # (H,W,nL*C_out)
-        B = self._apply_family(x_chw, self.B_kers)  # (H,W,nB*C_out)
-        ALL = np.concatenate([t for t in (G, L, B) if t.shape[2] > 0], axis=2) if (self.nG + self.nL + self.nB) > 0 \
-              else np.zeros((x_chw.shape[1], x_chw.shape[2], 0), dtype=self.dtype)
+    def forward(self, x_bhwc: np.ndarray) -> Dict[str, np.ndarray]:
+        print("\nClassicFilterBankNP.forward: Applying filter bank...")
+        x_bchw, C_out = self._ensure_chw(x_bhwc)
+        B, C, H, W = x_bchw.shape
+
+        num_batches = (B + self.batch_size - 1) // self.batch_size
+        all_results = []
+
+        for i in range(num_batches):
+            start_idx = i * self.batch_size
+            end_idx = min((i + 1) * self.batch_size, B)
+            batch_x = x_bchw[start_idx:end_idx]
+            
+            print(f"ClassicFilterBankNP.forward: Processing sub-batch {i+1}/{num_batches} (images {start_idx}-{end_idx-1})...")
+
+            batch_results = []
+            for j in range(batch_x.shape[0]): # Loop over images in the sub-batch
+                x_chw_single = batch_x[j] # (C,H,W)
+                
+                # Apply filters to this single image
+                G_responses = self._apply_family(x_chw_single, self.G_kers)
+                L_responses = self._apply_family(x_chw_single, self.L_kers)
+                B_responses = self._apply_family(x_chw_single, self.B_kers)
+                
+                ALL = np.concatenate([t for t in (G_responses, L_responses, B_responses) if t.shape[2] > 0], axis=2)
+                batch_results.append(ALL)
+
+            all_results.append(np.stack(batch_results, axis=0))
+
+        # Concatenate results from all sub-batches
+        final_responses = np.concatenate(all_results, axis=0)
+
+        # The meta-information is consistent across the batch
         meta = {
             "n_gaussian": self.nG, "n_laplacian": self.nL, "n_gabor": self.nB,
-            "per_channel": self.per_channel, "C_out": C_out
+            "per_channel": self.per_channel, "C_out": C_out,
+            "input_shape": x_bhwc.shape
         }
-        return {"gaussian": G, "laplacian": L, "gabor": B, "all": ALL, "meta": meta}
+        print("ClassicFilterBankNP.forward: Filter bank application complete.")
+        # Note: This simplified version only returns 'all' and 'meta'.
+        # You can expand it to return separated G, L, B if needed.
+        return {"all": final_responses, "meta": meta}
 
 
 
@@ -452,10 +552,21 @@ class Binarizer:
     - You can fit on one dataset (train) and transform on another (val/test).
     """
 
-    def __init__(self, cfg: Optional[BinarizerConfig] = None):
+    def __init__(self, cfg: Optional[BinarizerConfig] = None, config: Optional[dict] = None):
         self.cfg = cfg or BinarizerConfig()
         self.thr_filters_: Optional[np.ndarray] = None   # shape (F, 4) for (q20, q40, q60, q80)
         self.thr_kmeans_: Optional[np.ndarray] = None    # shape (K, 4)
+
+        # Load thresholds from the config dictionary if they are provided
+        if config:
+            if 'thresholds_filters' in config and config['thresholds_filters'] is not None:
+                print("Binarizer: Loading filter thresholds from config.")
+                self.thr_filters_ = np.array(config['thresholds_filters'], dtype=np.float32)
+            if 'thresholds_kmeans' in config and config['thresholds_kmeans'] is not None:
+                print("Binarizer: Loading kmeans thresholds from config.")
+                self.thr_kmeans_ = np.array(config['thresholds_kmeans'], dtype=np.float32)
+
+
 
     # -------------------------
     # Filters: fit + transform
@@ -563,6 +674,14 @@ class Binarizer:
         info = {**info_f, **info_d}
         return Ball, info
 
+    def fit_both(self, R: np.ndarray, D: np.ndarray) -> "Binarizer":
+        """
+        Fit thresholds on both filter responses (R) and KMeans distances (D).
+        """
+        self.fit_filters(R)
+        self.fit_kmeans(D)
+        return self
+
     def transform_both(self, R: np.ndarray, D: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
         """
         Transform with already-fitted thresholds; returns concatenated binaries and threshold tables.
@@ -573,11 +692,53 @@ class Binarizer:
         info = {**info_f, **info_d}
         return Ball, info
 # --------------------------
+# Saving function with metadata
+# --------------------------
+def save_features_with_metadata_npz(feature_dict: dict, output_path: str, metadata: Optional[dict] = None):
+    """
+    Saves a nested dictionary of NumPy arrays to a compressed .npz file
+    by flattening the dictionary keys, and includes a metadata dictionary.
+
+    Parameters
+    ----------
+    feature_dict : dict
+        The nested dictionary of feature arrays to save.
+    output_path : str
+        Path to the output .npz file.
+    metadata : dict, optional
+        A dictionary of metadata to save alongside the arrays.
+    """
+    # 1. Flatten the nested dictionary of arrays
+    flat_dict = {}
+    for source, source_dict in feature_dict.items():
+        if source == 'filters':
+            for filter_type, band_dict in source_dict.items():
+                for band, data in band_dict.items():
+                    key = f"{source}_{filter_type}_{band}"
+                    flat_dict[key] = data
+        elif source == 'kmeans':
+            for band, data in source_dict.items():
+                key = f"{source}_{band}"
+                flat_dict[key] = data
+
+    # 2. Add metadata to the dictionary to be saved
+    # We save the metadata dict as a 0-dimensional NumPy array of dtype=object.
+    if metadata:
+        # Use a key that is unlikely to clash with your feature keys
+        flat_dict['_metadata'] = np.array(metadata, dtype=object)
+
+    # 3. Save all items to a compressed .npz file
+    np.savez_compressed(output_path, **flat_dict)
+    print(f"\n--- Saving features with metadata ---")
+    print(f"Features and metadata saved to {output_path}")
+
+
+# --------------------------
 # Main processing function
 # --------------------------
-def process_batch(batch_img_rgb: np.ndarray, config: dict) -> dict:
+def transform_batch(batch_img_rgb: np.ndarray, kmeans: KMeansColorQuantizer, bank: ClassicFilterBankNP, binarizer: Binarizer) -> dict:
     """
-    Runs the full preprocessing pipeline on a batch of images.
+    Runs the transformation part of the preprocessing pipeline on a batch of images using pre-fitted processors.
     1. Applies a classic filter bank (Gaussian, Laplacian, Gabor).
     2. Computes K-Means color centroids and distances.
     3. Binarizes both feature sets into LOW, MID, HIGH bands.
@@ -587,59 +748,34 @@ def process_batch(batch_img_rgb: np.ndarray, config: dict) -> dict:
     ----------
     batch_img_rgb : np.ndarray
         A batch of images with shape (B, H, W, 3) and dtype uint8.
-    config : dict
-        A dictionary loaded from config.yaml containing all processing parameters.
+    kmeans : KMeansColorQuantizer
+        A pre-fitted K-Means quantizer.
+    bank : ClassicFilterBankNP
+        An initialized filter bank.
+    binarizer : Binarizer
+        A pre-fitted binarizer.
 
     Returns
     -------
     dict
         The final nested dictionary containing all binarized feature sets.
     """
-    # --- Setup parameters from config ---
-    kmeans_cfg = config['kmeans']
-    fb_cfg = config['filter_bank']
-    
+
     # Infer image dimensions from the input batch
     B, H, W, C_in = batch_img_rgb.shape
-
-    # Build filter specs from config
-    gs = [GaussianSpec(sigma=s) for s in fb_cfg['gaussian']['sigmas']]
-    ls = [LaplacianSpec(sigma=s) for s in fb_cfg['laplacian']['sigmas']]
-    thetas = np.linspace(0, math.pi, fb_cfg['gabor']['num_thetas'], endpoint=False)
-    bs = [GaborSpec(theta=t, lambd=fb_cfg['gabor']['lambd']) for t in thetas]
-
-    # --- Create dummy data and filter bank ---
-    bank = ClassicFilterBankNP(gs, ls, bs, per_channel=fb_cfg['per_channel'], padding=fb_cfg['padding'])
     
-    # --- K-Means quantization example ---
-    print("\n--- K-Means Example ---")
-    kmeans = KMeansColorQuantizer(K=kmeans_cfg['num_centroids'], random_state=kmeans_cfg['random_state'])
-    
-    print(f"Fitting K-Means with {kmeans.K} centroids on the RGB image...")
-    kmeans.fit(batch_img_rgb)
-    quantized_img = kmeans.transform(batch_img_rgb)
-    print("K-Means centroids (RGB):\n", kmeans.centroids_)
-    print("Quantized image shape:", quantized_img.shape, "and dtype:", quantized_img.dtype)
-
-    # --- K-Means distance calculation example ---
-    print("\n--- K-Means Distance Calculation Example ---")
-    print(f"Calculating distances for a batch of images with shape: {batch_img_rgb.shape}")
+    # --- 1. K-Means distance calculation ---
+    print(f"\nCalculating K-Means distances for batch with shape: {batch_img_rgb.shape}")
     distances = kmeans.get_distances(batch_img_rgb)
     print("Output distances shape (B, H, W, K):", distances.shape)
 
-    # --- Binarization example ---
-    print("\n--- Binarization Example ---")
-    # 1. Apply the filter bank to the same batch of images to get filter responses.
-    #    We loop because the current filter bank processes one image at a time.
-    filter_responses_batch = np.stack(
-        [bank.forward(img)["all"] for img in batch_img_rgb],
-        axis=0
-    )
+    # --- 2. Filter bank application ---
+    filter_responses_batch = bank.forward(batch_img_rgb)["all"]
     print(f"Filter responses batch shape (B, H, W, F): {filter_responses_batch.shape}")
 
-    # 2. Instantiate the Binarizer and binarize both filter responses and distances.
-    binarizer = Binarizer()
-    binary_features, info = binarizer.fit_transform_both(R=filter_responses_batch, D=distances)
+    # --- 3. Binarization (transform only) ---
+    print("\nBinarizing features using pre-fitted thresholds...")
+    binary_features, info = binarizer.transform_both(R=filter_responses_batch, D=distances)
     print(f"Combined binary features shape (B, H, W, 3F+3K): {binary_features.shape}")
 
     # --- Organize binarized features into a structured dictionary ---
@@ -703,24 +839,72 @@ def process_batch(batch_img_rgb: np.ndarray, config: dict) -> dict:
     
     return feature_dict
 
+def create_and_fit_processors(training_data: np.ndarray, config: dict) -> Tuple[KMeansColorQuantizer, ClassicFilterBankNP, Binarizer]:
+    """
+    Creates and fits the K-Means, Filter Bank, and Binarizer on the training data.
 
-# --------------------------
-# Example usage
-# --------------------------
-if __name__ == "__main__":
-    import yaml
-    import os
+    Parameters
+    ----------
+    training_data : np.ndarray
+        The training image data, shape (B, H, W, 3).
+    config : dict
+        The application configuration dictionary.
 
-    # --- Load configuration from YAML ---
-    # Assumes the script is run from the project root (e.g., CNNPytorchTM/)
-    config_path = os.path.join('config', 'config.yaml')
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+    Returns
+    -------
+    Tuple[KMeansColorQuantizer, ClassicFilterBankNP, Binarizer]
+        A tuple containing the fitted K-Means model, the initialized filter bank,
+        and the fitted Binarizer.
+    """
+    kmeans_cfg = config['kmeans']
+    fb_cfg = config['filter_bank']
+    binarizer_cfg = config.get('binarizer', {}) # Use .get for safe access
 
-    # --- Create a dummy batch of images for demonstration ---
-    # For demonstration, we define dummy dimensions here. The process_batch function infers them from its input.
-    dummy_batch = (np.random.rand(4, 128, 128, 3) * 255).astype(np.uint8) # Example with batch size=4, H=W=128
+    # 1. --- Fit K-Means on training data ---
+    print("\n--- Fitting K-Means on Training Data ---")
+    # Initialize with config; if centroids are present, it will load them and skip fitting.
+    kmeans = KMeansColorQuantizer(config=kmeans_cfg,
+        K=kmeans_cfg['num_centroids'],
+        random_state=kmeans_cfg['random_state'],
+        max_pixels_for_fit=kmeans_cfg.get('max_pixels_for_fit')
+    )
+    kmeans.fit(training_data)
+    print("K-Means fitting complete. Centroids:\n", kmeans.centroids_)
 
-    # --- Run the processing pipeline ---
-    final_features = process_batch(dummy_batch, config)
-    print("\nProcessing complete. The final feature dictionary has been generated.")
+    # 2. --- Initialize Filter Bank ---
+    print("\n--- Initializing Filter Bank ---")
+    gs = [GaussianSpec(sigma=s) for s in fb_cfg['gaussian']['sigmas']]
+    ls = [LaplacianSpec(sigma=s) for s in fb_cfg['laplacian']['sigmas']]
+    thetas = np.linspace(0, math.pi, fb_cfg['gabor']['num_thetas'], endpoint=False)
+    bs = [GaborSpec(theta=t, lambd=fb_cfg['gabor']['lambd']) for t in thetas]
+    bank = ClassicFilterBankNP(
+        gs, ls, bs,
+        per_channel=fb_cfg['per_channel'],
+        padding=fb_cfg['padding'],
+        batch_size=fb_cfg.get('processing_batch_size', 32)
+    )
+
+    # 3. --- Fit Binarizer on a SAMPLE of training data features ---
+    print("\n--- Fitting Binarizer on a Sample of Training Data Features ---")
+    # Use a small, random sample of the training data to efficiently estimate quantile thresholds.
+    # This avoids processing the entire training set just for fitting.
+    sample_size = binarizer_cfg.get('fit_sample_size', 5000)
+    print(f"Sampling {sample_size} images from training data to fit binarizer thresholds.")
+    
+    # Use a consistent random state for reproducibility
+    rng = np.random.default_rng(kmeans_cfg.get('random_state'))
+    sample_indices = rng.choice(training_data.shape[0], size=min(sample_size, training_data.shape[0]), replace=False)
+    fit_sample_data = training_data[sample_indices]
+
+    print("Generating features for the sample to learn binarization thresholds...")
+    # Generate K-Means distances and Filter responses for this small sample
+    training_kmeans_distances = kmeans.get_distances(fit_sample_data)
+    training_filter_responses = bank.forward(fit_sample_data)["all"]
+
+    # Initialize binarizer (it won't find thresholds in the config, so it will be unfitted)
+    binarizer = Binarizer(config=config.get('binarizer'))
+    # Now, fit it using the generated features
+    binarizer.fit_both(R=training_filter_responses, D=training_kmeans_distances)
+    print("Binarizer fitting complete.")
+
+    return kmeans, bank, binarizer
