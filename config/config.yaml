@@ -1,0 +1,25 @@
+# Configuration for pre_processing_tools.py main execution
+
+# K-Means parameters
+kmeans:
+  num_centroids: 4
+  random_state: 42
+
+# Filter Bank parameters
+filter_bank:
+  per_channel: true
+  padding: "reflect"
+
+  # Gaussian filter specifications: list of sigmas
+  gaussian:
+    sigmas: [1.0, 2.0]
+
+  # Laplacian / LoG filter specifications: list of sigmas
+  # Use 'null' for the standard 3x3 Laplacian, or a float for LoG sigma
+  laplacian:
+    sigmas: [null, 1.5]
+
+  # Gabor filter specifications
+  gabor:
+    num_thetas: 6  # Number of orientations from 0 to pi
+    lambd: 8.0
