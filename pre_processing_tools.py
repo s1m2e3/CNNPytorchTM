@@ -720,7 +720,9 @@ def save_features_with_metadata_npz(feature_dict: dict, output_path: str, metada
             for band, data in source_dict.items():
                 key = f"{source}_{band}"
                 flat_dict[key] = data
-
+        elif source == 'labels':
+            # Directly add the labels array to the flat dictionary
+            flat_dict['labels'] = source_dict
     # 2. Add metadata to the dictionary to be saved
     # We save the metadata dict as a 0-dimensional NumPy array of dtype=object.
     if metadata:

@@ -67,22 +67,3 @@ if __name__ == "__main__":
             
             save_features_with_metadata_npz(final_features, output_path, metadata=config)
             print(f"Batch {i+1} processing complete. Saved to {output_path}")
-
-
-    # # --- Example of how to load the data, metadata, and labels ---
-    # print("\n--- Loading and verifying the last saved file ---")
-    # loaded_data = np.load(output_path, allow_pickle=True)
-    
-    # # Retrieve the metadata
-    # # The metadata is a 0-d array; use .item() to get the dictionary back
-    # loaded_metadata = loaded_data['_metadata'].item()
-    
-    # print("Successfully loaded metadata. K-Means config from metadata:")
-    # print(loaded_metadata['kmeans'])
-
-    # # You can now access your feature arrays AND the labels
-    # gaussian_low_band = loaded_data['filters_gaussian_low']
-    # saved_labels = loaded_data['labels']
-    # print(f"\nShape of loaded 'filters_gaussian_low': {gaussian_low_band.shape}")
-    # print(f"Shape of loaded 'labels': {saved_labels.shape}")
-    # print(f"First 5 labels: {saved_labels[:5].flatten()}")

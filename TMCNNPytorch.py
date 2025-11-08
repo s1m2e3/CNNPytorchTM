@@ -94,7 +94,6 @@ class TMClauses(nn.Module):
         self,
         num_classes: int,
         clauses_per_class: int,
-        D_literals: int,
         init_clause_mask: Optional[torch.Tensor] = None,
         learn_alpha: bool = True,
         init_alpha: float = 1.0,
@@ -102,20 +101,16 @@ class TMClauses(nn.Module):
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
+        # Store config; D (literals) will be inferred on first forward pass
         self.Cc = num_classes
         self.K  = clauses_per_class
         self.M  = num_classes * clauses_per_class
-        self.D  = D_literals
-
-        # ----- Clause definition mask (discrete): [M, D] bool -----
-        if init_clause_mask is None:
-            clause_mask = torch.zeros(self.M, self.D, dtype=torch.bool, device=device)
-        else:
-            assert init_clause_mask.shape == (self.M, self.D)
-            clause_mask = init_clause_mask.to(device=device, dtype=torch.bool)
-
-        # Store as a buffer (fixed, non-differentiable); update it manually with your feedback logic.
-        self.register_buffer("clause_mask", clause_mask)
+        self.D: Optional[int] = None  # To be initialized lazily
+        self._init_clause_mask = init_clause_mask  # Store for lazy init
+        self._device = device
+        self._dtype = dtype
+        self.clauses = {i+1:{"positive": [], "negative": []} for i in range(num_classes)}
+        self.is_initialized = False
 
         # ----- Per-clause weights α (learnable, differentiable) -----
         if learn_alpha:
@@ -123,13 +118,146 @@ class TMClauses(nn.Module):
         else:
             self.register_buffer("alpha", torch.full((self.M,), float(init_alpha), dtype=dtype, device=device))
 
+    def _lazy_initialize(self, D_literals: int):
+        """Initializes buffers that depend on the number of literals, D."""
+        print(f"TMClauses: Lazily initializing with D_literals = {D_literals}")
+        self.D = D_literals
+        device, dtype = self.alpha.device, self.alpha.dtype # Use device/dtype of existing parameters
+
+        # ----- Clause definition mask (discrete): [M, D] bool -----
+        if self._init_clause_mask is None:
+            clause_mask = torch.zeros(self.M, self.D, dtype=torch.bool, device=device)
+        else:
+            assert self._init_clause_mask.shape == (self.M, self.D)
+            clause_mask = self._init_clause_mask.to(device=device, dtype=torch.bool)
+
+        # Store as a buffer (fixed, non-differentiable); update it manually with your feedback logic.
+        self.register_buffer("clause_mask", clause_mask)
+
         # ----- Memory dictionary (TA counters, usage stats, etc.) -----
         self.memory: Dict[str, torch.Tensor] = {
-            "literal_ta": torch.zeros(self.M, self.D, dtype=torch.int16, device=device),
-            "fires":      torch.zeros(self.M, dtype=torch.int32, device=device),
-            "uses":       torch.zeros(self.M, dtype=torch.int32, device=device),
+            "literal_ta": torch.zeros(self.M, self.D, dtype=torch.int16, device=self.clause_mask.device),
+            "fires":      torch.zeros(self.M, dtype=torch.int32, device=self.clause_mask.device),
+            "uses":       torch.zeros(self.M, dtype=torch.int32, device=self.clause_mask.device),
             "meta":       {"num_classes": self.Cc, "clauses_per_class": self.K, "D_literals": self.D}
         }
+        
+        # Clean up and mark as initialized
+        self.is_initialized = True
+        del self._init_clause_mask
+
+    def clause_composition(self,x,y, literals_per_clause_proportion=0.05, batch_size=50, sampled_literal_trials=10):
+        # Assuming x is a batch of literals of shape [B, D, L] where L is the number of patches 
+        # Assuming y is a batch of labels of shape [B, C] where C is the number of classes
+        B, D, L = x.shape
+        literals_per_clause = 6
+        
+
+        # Now, iterate through the data in mini-batches
+        num_samples = B
+        num_batches = (num_samples + batch_size - 1) // batch_size
+        print(f"\nProcessing in {num_batches} mini-batches of size {batch_size}...")
+
+        for i in range(num_batches):
+            
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, num_samples)
+            labels_batch = y[start_idx:end_idx]
+            one_hot_labels = self.one_hot(labels_batch)
+            for k in range(sampled_literal_trials):
+                sampled_indexes = torch.randperm(D)[:literals_per_clause]
+                # Slice the literals tensor 'x' along the second dimension (D) using the sampled indices.
+                sliced_literals = x[:, sampled_indexes, :]
+                print(f"Shape of original literals: {x.shape}")
+                print(f"Shape of sliced literals after feature selection: {sliced_literals.shape}")
+                literals_batch = sliced_literals[start_idx:end_idx]
+                or_patches = self.forward(literals_batch, clause_definition=True).int()
+                mi_batch = []
+                for j in range(one_hot_labels.shape[1]):
+                    mi_batch.append(self.mutual_information(or_patches, one_hot_labels[:, j]))
+                    
+                mi_batch = torch.stack(mi_batch)
+                best_column = mi_batch.argmax().item()
+                if mi_batch[best_column].item()>1e-3:
+                    positive = (one_hot_labels[:, best_column]*or_patches).sum()
+                    negative = ((1-one_hot_labels[:, best_column])*(1-or_patches)).sum()
+                    if positive.item()>negative.item():
+                        self.evaluate_mutual_information_gain(best_column+1,sampled_indexes,"positive",x)
+                        print("positive")
+                    else:
+                        self.evaluate_mutual_information_gain(best_column+1,sampled_indexes,"negative",x)
+                        print("negative")
+                input('hipi')
+            print(f"  - Mini-batch {i+1} literals shape: {literals_batch.shape}, labels shape: {labels_batch.shape}")
+
+    def evaluate_mutual_information_gain(self,clause_index,sampled_indexes,positive_or_negative,x,batch_size=50,threshold=0.8):
+        existing_clauses = self.clauses[clause_index][positive_or_negative]
+        sampled_rows = torch.randperm(x.shape[0])[:batch_size]
+        sampled_x = x[sampled_rows]
+        newly_evaluated_literals = sampled_x[:,sampled_indexes]
+        or_patches = self.forward(newly_evaluated_literals, clause_definition=True)
+        if len(existing_clauses)>0:
+            for already_sampled_indexes in self.clauses[clause_index][positive_or_negative]:
+                literal_batch_previously_evaluated = sampled_x[:,already_sampled_indexes]
+                or_patches_previously_evaluated = self.forward(literal_batch_previously_evaluated, clause_definition=True)
+                intersection = (or_patches & or_patches_previously_evaluated).sum()
+                print(intersection)
+                union = (or_patches | or_patches_previously_evaluated).sum()
+                print(union)
+                input('hipo')
+                jaccard = intersection.float() / (union.float()+1e-6)
+                if jaccard>threshold:
+                    return
+        else:
+            self.clauses[clause_index][positive_or_negative].append(sampled_indexes)
+        self.clauses[clause_index][positive_or_negative].append(sampled_indexes)
+
+    def one_hot(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        Converts a tensor of class labels to a one-hot encoded tensor.
+
+        Parameters:
+        - y (torch.Tensor): A 1D or 2D tensor of class labels (integers). If 2D, it will be squeezed.
+
+        Returns:
+        - torch.Tensor: The one-hot encoded tensor of shape (len(y), self.Cc).
+        """
+        return F.one_hot(y.squeeze().long(), num_classes=self.Cc)
+    def mutual_information(self, x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+        """
+        Calculates the mutual information I(X; Y) between two binary vectors.
+
+        Parameters:
+        - x (torch.Tensor): A 1D binary tensor.
+        - y (torch.Tensor): A 1D binary tensor of the same length as x.
+        - eps (float): A small epsilon to prevent log(0).
+
+        Returns:
+        - torch.Tensor: A scalar tensor representing the mutual information in bits.
+        """
+        x = x.float()
+        y = y.float()
+
+        # Probabilities for X
+        p_x1 = x.mean()
+        p_x0 = 1.0 - p_x1
+        h_x = -(p_x0 * torch.log2(p_x0 + eps) + p_x1 * torch.log2(p_x1 + eps))
+
+        # Probabilities for Y
+        p_y1 = y.mean()
+        p_y0 = 1.0 - p_y1
+        h_y = -(p_y0 * torch.log2(p_y0 + eps) + p_y1 * torch.log2(p_y1 + eps))
+
+        # Joint probabilities
+        p_11 = (x * y).mean()
+        p_01 = ((1 - x) * y).mean()
+        p_10 = (x * (1 - y)).mean()
+        p_00 = ((1 - x) * (1 - y)).mean()
+        h_xy = -(p_00 * torch.log2(p_00 + eps) + p_01 * torch.log2(p_01 + eps) +
+                 p_10 * torch.log2(p_10 + eps) + p_11 * torch.log2(p_11 + eps))
+
+        # Mutual Information: I(X;Y) = H(X) + H(Y) - H(X,Y)
+        return h_x + h_y - h_xy
 
     @torch.no_grad()
     def set_clause_mask(self, new_mask: torch.Tensor):
@@ -145,7 +273,7 @@ class TMClauses(nn.Module):
         """
         self.memory["literal_ta"].add_(delta.to(self.memory["literal_ta"].dtype))
 
-    def forward(self, literals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, literals: torch.Tensor, clause_definition: bool=False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""
         literals: [B, D, L] in {0,1}  (from TMCNNClass)
         Returns:
@@ -154,6 +282,11 @@ class TMClauses(nn.Module):
             logits     : [B, Cc]  float  (weighted votes with per-clause α; pos - neg per class)
         """
         B, D, L = literals.shape
+
+        # Lazily initialize buffers on the first forward pass
+        if not self.is_initialized:
+            self._lazy_initialize(D)
+
         assert D == self.D, f"Expected D={self.D}, got {D}."
 
         # --- Evaluate clauses on each patch ---
@@ -165,66 +298,27 @@ class TMClauses(nn.Module):
         # literals_sel_mℓ = literals[:, selected_idx, ℓ]
         # We'll do this with boolean masking per clause in a vectorized way:
 
-        # Expand literals for broadcasting: [B, 1, D, L]
-        lit = literals.unsqueeze(1)                 # [B, 1, D, L]
-        mask = self.clause_mask.unsqueeze(0).unsqueeze(-1)  # [1, M, D, 1]
-        # Keep only selected literals (others set to 1 so they don't affect AND/min)
-        lit_masked = torch.where(mask, lit, torch.ones_like(lit))  # [B, M, D, L]
-        # AND across selected literals == min across D equals 1  (since values are 0 or 1)
-        clause_map = (lit_masked.min(dim=2).values == 1)  # [B, M, L] bool
-
+        # AND across selected literals by taking the product. Result is 1.0 iff all selected literals are 1.0.
+        clause_map = literals.prod(dim=1).bool()  # [B,  L] bool
         # --- OR across patches (clause fires if any patch satisfies it) ---
-        clause_or = clause_map.any(dim=-1)  # [B, M] bool
+        clause_or = clause_map.any(dim=-1)  # [B, 1] bool
+        if not clause_definition:
+            # --- Bookkeeping: update memory usage/fires counters (no grad) ---
+            with torch.no_grad():
+                self.memory["uses"]  += torch.tensor(L, device=clause_or.device, dtype=torch.int32)
+                self.memory["fires"] += clause_or.sum(dim=0).to(self.memory["fires"].dtype)
 
-        # --- Bookkeeping: update memory usage/fires counters (no grad) ---
-        with torch.no_grad():
-            self.memory["uses"]  += torch.tensor(L, device=clause_or.device, dtype=torch.int32)
-            self.memory["fires"] += clause_or.sum(dim=0).to(self.memory["fires"].dtype)
+            # --- Voting: per-class positive vs negative halves, weighted by α ---
+            z = clause_or.float()                              # [B, M]
+            alpha = self.alpha                                 # [M]
+            scores = []
+            for c in range(self.Cc):
+                s, h = c*self.K, self.K//2
+                pos = (z[:, s:s+h] * alpha[s:s+h]).sum(dim=1)
+                neg = (z[:, s+h:s+self.K] * alpha[s+h:s+self.K]).sum(dim=1)
+                scores.append(pos - neg)
+            logits = torch.stack(scores, dim=1)               # [B, Cc]
 
-        # --- Voting: per-class positive vs negative halves, weighted by α ---
-        z = clause_or.float()                              # [B, M]
-        alpha = self.alpha                                 # [M]
-        scores = []
-        for c in range(self.Cc):
-            s, h = c*self.K, self.K//2
-            pos = (z[:, s:s+h] * alpha[s:s+h]).sum(dim=1)
-            neg = (z[:, s+h:s+self.K] * alpha[s+h:s+self.K]).sum(dim=1)
-            scores.append(pos - neg)
-        logits = torch.stack(scores, dim=1)               # [B, Cc]
-
-        return clause_map, clause_or, logits
-
-
-# -----------------------------------------------------------------------------
-# Minimal wiring example (CPU)
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    # Fake binary batch: B=4, C=1, H=W=8
-    B, C, H, W = 4, 1, 8, 8
-    x = (torch.rand(B, C, H, W) > 0.7).float()
-
-    # 1) Extract literals with TMCNNClass
-    kh, kw = 3, 3
-    extractor = TMCNNClass(in_channels=C, kernel_size=(kh, kw))
-    out = extractor(x)
-    literals = out["literals"]        # [B, 2*C*kh*kw, L]
-    D = literals.shape[1]
-    # # 2) Define TMClauses (e.g., 2 classes, 20 clauses/class)
-    num_classes, K = 2, 20
-    tm = TMClauses(num_classes, K, D_literals=D, learn_alpha=True, init_alpha=1.0)
-
-    # # Optional: set an initial clause mask (here, randomly choose 5 literals per clause)
-    # with torch.no_grad():
-    #     init_mask = torch.zeros(tm.M, D, dtype=torch.bool)
-    #     for m in range(tm.M):
-    #         idx = torch.randperm(D)[:5]
-    #         init_mask[m, idx] = True
-    #     tm.set_clause_mask(init_mask)
-
-    # # Forward: get per-patch clause map, per-sample clause OR, and class logits
-    clause_map, clause_or, logits = tm(literals)
-    print(clause_map.shape,clause_or.shape,logits.shape)
-    # # logits can be trained with cross-entropy; only α is learnable by default
-    # y = torch.randint(0, num_classes, (B,))
-    # loss = F.cross_entropy(logits, y)
-    # loss.backward()  # grads flow only to α
+            return clause_map, clause_or, logits
+        else:
+            return clause_or
