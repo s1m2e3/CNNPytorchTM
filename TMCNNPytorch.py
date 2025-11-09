@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from typing import Dict, Optional, Tuple
 from sklearn.linear_model import LogisticRegression
-
+import contextlib
+import numpy as np
 # -----------------------------------------------------------------------------
 # TMCNNClass
 # -----------------------------------------------------------------------------
@@ -125,6 +125,7 @@ class TMClauses(nn.Module):
         self._dtype = dtype
         self.clauses = {i+1:{"positive": [], "negative": []} for i in range(num_classes)}
         self.is_initialized = False
+        self.relevant_indices = []
 
         # ----- Per-clause weights α (learnable, differentiable) -----
         if learn_alpha:
@@ -172,10 +173,10 @@ class TMClauses(nn.Module):
         flattened_x = x_combined_np.reshape(x_combined_np.shape[0], x_combined_np.shape[1]* x_combined_np.shape[2])
         # Run logistic regression to analyze feature importance
         
-        coefficients = self.run_logistic_regression(flattened_x, one_hot_labels_np, num_trials=50, num_features_to_sample=100)
-        index = np.where(coefficients>1)
-        print(coefficients.shape)
-        print(len(index[0]), len(index[1]))
+        coefficients = self.run_logistic_regression(flattened_x, one_hot_labels_np, num_trials=100, num_features_to_sample=100, verbose=False)
+        coefficients = np.where(coefficients>0, 1, 0).sum(axis=0)
+        coefficients_index = np.where(coefficients>0)[0]
+        print(coefficients_index.shape)
         input("Press enter to continue")
         # 2. Convert NumPy arrays to PyTorch tensors to work with the rest of the class
         device = self.alpha.device if self.is_initialized else 'cpu'
@@ -260,69 +261,6 @@ class TMClauses(nn.Module):
         - torch.Tensor: The one-hot encoded tensor of shape (len(y), self.Cc).
         """
         return F.one_hot(y.squeeze().long(), num_classes=self.Cc)
-
-    def one_hot_numpy(self, y: np.ndarray) -> np.ndarray:
-        """
-        Converts a NumPy array of class labels to a one-hot encoded NumPy array.
-
-        Parameters:
-        - y (np.ndarray): A 1D or 2D array of class labels (integers). If 2D, it will be squeezed.
-
-        Returns:
-        - np.ndarray: The one-hot encoded array of shape (len(y), self.Cc), with dtype uint8.
-        """
-        y_squeezed = np.squeeze(y).astype(int)
-        num_samples = y_squeezed.shape[0]
-        one_hot_array = np.zeros((num_samples, self.Cc), dtype=np.uint8)
-        one_hot_array[np.arange(num_samples), y_squeezed] = 1
-        return one_hot_array
-
-    def run_logistic_regression(self, flattened_x: np.ndarray, one_hot_labels: np.ndarray, num_trials: int = 10, num_features_to_sample: int = 100):
-        """
-        Performs multi-class logistic regression on random feature subsets to find important features.
-
-        Parameters:
-        - flattened_x (np.ndarray): The feature matrix of shape (num_samples, num_features).
-        - one_hot_labels (np.ndarray): The one-hot encoded labels of shape (num_samples, num_classes).
-        - num_trials (int): The number of times to run the regression on different feature subsets.
-        - num_features_to_sample (int): The number of features to randomly sample in each trial.
-        """
-        print(f"\n--- Running Logistic Regression for feature analysis ({num_trials} trials) ---")
-        num_samples, num_total_features = flattened_x.shape
-        num_classes = one_hot_labels.shape[1]
-        
-        # Convert one-hot labels back to a 1D array of class indices for scikit-learn
-        y_indices = np.argmax(one_hot_labels, axis=1)
-
-        # This array will store the accumulated importance scores for each feature.
-        aggregate_coeffs = np.zeros((num_classes, num_total_features))
-
-        log_reg = LogisticRegression(multi_class='ovr', solver='lbfgs', C=0.1, max_iter=100, random_state=42)
-        
-        for i in range(num_trials):
-            print(f"  - Trial {i+1}/{num_trials}...", end='\r')
-            # Randomly sample 'num_features_to_sample' feature indices without replacement
-            feature_indices = np.random.choice(num_total_features, size=num_features_to_sample, replace=False)
-            
-            # Create a view of the data with only the sampled features
-            x_subset = flattened_x[:, feature_indices]
-            
-            try:
-                log_reg.fit(x_subset, y_indices)
-                # Calculate accuracy on the training subset
-                accuracy = log_reg.score(x_subset, y_indices)
-                # Calculate and display the 60th percentile of the absolute coefficient values
-                abs_coeffs = np.abs(log_reg.coef_).mean(axis=0)
-                quantile_60 = np.quantile(abs_coeffs, 0.60)
-                print(f"  - Trial {i+1}/{num_trials}... Accuracy: {accuracy:.2f}, 60th percentile of |coeffs|: {quantile_60:.4f}", end='\r')
-                relevant_features = np.where(abs_coeffs >= quantile_60)[0]
-                # Add the coefficients from this trial back to the aggregate matrix at their original positions
-                aggregate_coeffs[:, feature_indices[relevant_features]] += 1
-            except Exception as e:
-                print(f"\nAn error occurred during trial {i+1}: {e}")
-
-        print(f"\nLogistic Regression analysis complete. Aggregate coefficients shape: {aggregate_coeffs.shape}")
-        return aggregate_coeffs
 
     def mutual_information(self, x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
         """
