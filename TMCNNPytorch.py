@@ -1,17 +1,18 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import Dict, Optional, Tuple
+from sklearn.linear_model import LogisticRegression
 
 # -----------------------------------------------------------------------------
 # TMCNNClass
 # -----------------------------------------------------------------------------
-class TMCNNClass(nn.Module):
+class TMCNNClass:
     r"""
-    Convolutional patch/literal extractor for Tsetlin-style pipelines.
+    Convolutional patch/literal extractor for Tsetlin-style pipelines using NumPy.
 
     IMPORTANT: Inputs **must be binary** tensors in {0,1}.
-               If you start from grayscale, binarize BEFORE calling forward.
 
     What it does
     ------------
@@ -19,45 +20,58 @@ class TMCNNClass(nn.Module):
     - Produces *all possible literals* per patch:
         * positive literals  : x
         * negative literals  : 1 - x
-      packed along the "literal" dimension so downstream modules can form clauses.
+      packed along the "literal" dimension.
+
+    Input
+    -----
+    - x: NumPy array of shape [B, H, W, C] with values in {0,1}.
 
     Output
     ------
     Returns a dict with:
-      - 'literals': [B, 2*C*kh*kw, L] float in {0,1}  (L = number of patches = H_out * W_out)
-      - 'spatial': (H_out, W_out)                      (so you can map L back to 2-D)
+      - 'literals': [B, 2*C*kh*kw, L] uint8 in {0,1} (L = number of patches)
+      - 'spatial': (H_out, W_out)
       - 'meta': {'C': C, 'kh': kh, 'kw': kw}
     """
-    def __init__(self, in_channels: int, kernel_size: Tuple[int, int]):
-        super().__init__()
-        self.C = in_channels
-        self.kh, self.kw = kernel_size
-        # We use Unfold for exact patch extraction (no learnable params).
-        self.unfold = nn.Unfold(kernel_size=kernel_size, stride=1, padding=0)
+    def __init__(self):
+        pass
 
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        assert x.dtype in (torch.float32, torch.float16, torch.bfloat16) or x.dtype == torch.uint8, \
-            "Input dtype should be float/uint8 with values in {0,1}."
-        # x: [B, C, H, W] with values in {0,1}
-        B, C, H, W = x.shape
-        assert C == self.C, f"Expected {self.C} channels, got {C}."
-        # Extract patches -> [B, C*kh*kw, L]
-        pos = self.unfold(x.float())
+    def forward(self, x: np.ndarray, kernel_size: Tuple[int, int]) -> Dict[str, np.ndarray]:
+        """
+        x: NumPy array of shape [B, H, W, C] with values in {0,1}.
+        kernel_size: Tuple (kh, kw) for the patch dimensions.
+        """
+        assert isinstance(x, np.ndarray), "Input must be a NumPy array."
+        assert x.ndim == 4, f"Input must be a 4D array [B, H, W, C], but got {x.ndim} dimensions."
+        B, H, W, C = x.shape
+        kh, kw = kernel_size
+
+        x_uint8 = x.astype(np.uint8)
+
+        H_out = H - kh + 1
+        W_out = W - kw + 1
+        L = H_out * W_out
+
+        # Use stride tricks for efficient patch extraction (no data duplication)
+        shape = (B, H_out, W_out, C, kh, kw)
+        strides = x_uint8.strides
+        new_strides = (strides[0], strides[1], strides[2], strides[3], strides[1], strides[2])
+        
+        # Create a view of patches: [B, H_out, W_out, C, kh, kw]
+        patches = np.lib.stride_tricks.as_strided(x_uint8, shape=shape, strides=new_strides)
+
+        # Reshape to get positive literals: [B, C*kh*kw, L]
+        pos = patches.transpose(0, 3, 4, 5, 1, 2).reshape(B, C * kh * kw, L)
         neg = 1.0 - pos
-        # Concatenate all literals along feature (literal) dimension
-        literals = torch.cat([pos, neg], dim=1)  # [B, 2*C*kh*kw, L]
 
-        # Spatial size of the sliding windows
-        H_out = H - self.kh + 1
-        W_out = W - self.kw + 1
+        # Concatenate to form all literals: [B, 2*C*kh*kw, L]
+        literals = np.concatenate([pos, neg], axis=1)
 
         return {
             "literals": literals,                # [B, D, L] with D = 2*C*kh*kw
             "spatial": (H_out, W_out),
-            "meta": {"C": self.C, "kh": self.kh, "kw": self.kw}
+            "meta": {"C": C, "kh": kh, "kw": kw}
         }
-
 
 # -----------------------------------------------------------------------------
 # TMClauses
@@ -146,12 +160,31 @@ class TMClauses(nn.Module):
         self.is_initialized = True
         del self._init_clause_mask
 
-    def clause_composition(self,x,y, literals_per_clause_proportion=0.05, batch_size=50, sampled_literal_trials=10):
-        # Assuming x is a batch of literals of shape [B, D, L] where L is the number of patches 
-        # Assuming y is a batch of labels of shape [B, C] where C is the number of classes
-        B, D, L = x.shape
-        literals_per_clause = 6
+    def clause_composition(self, x_filters: np.ndarray, x_colors: np.ndarray, y: np.ndarray, literals_per_clause_proportion=0.05, batch_size=50, sampled_literal_trials=10):
+        """
+        x_filters: NumPy array of filter literals [B, D_filters, L]
+        x_colors: NumPy array of color literals [B, D_colors, L]
+        y: NumPy array of labels [B,]
+        """
+        # 1. Combine filter and color literals into a single NumPy array
+        x_combined_np = np.concatenate([x_filters, x_colors], axis=1)
+        one_hot_labels_np = self.one_hot_numpy(y)
+        flattened_x = x_combined_np.reshape(x_combined_np.shape[0], x_combined_np.shape[1]* x_combined_np.shape[2])
+        # Run logistic regression to analyze feature importance
         
+        coefficients = self.run_logistic_regression(flattened_x, one_hot_labels_np, num_trials=50, num_features_to_sample=100)
+        index = np.where(coefficients>1)
+        print(coefficients.shape)
+        print(len(index[0]), len(index[1]))
+        input("Press enter to continue")
+        # 2. Convert NumPy arrays to PyTorch tensors to work with the rest of the class
+        device = self.alpha.device if self.is_initialized else 'cpu'
+        x = torch.from_numpy(x_combined_np).to(device=device, dtype=self._dtype)
+        y = torch.from_numpy(y).to(device=device)
+
+        B, D, L = x.shape
+        literals_per_clause_filters = 6
+        literals_per_clause_colors = 2
 
         # Now, iterate through the data in mini-batches
         num_samples = B
@@ -165,7 +198,11 @@ class TMClauses(nn.Module):
             labels_batch = y[start_idx:end_idx]
             one_hot_labels = self.one_hot(labels_batch)
             for k in range(sampled_literal_trials):
-                sampled_indexes = torch.randperm(D)[:literals_per_clause]
+                sampled_indexes_filters = torch.randperm(x_filters.shape[1])[:literals_per_clause_filters]
+                sampled_indexes_colors = torch.randperm(x_colors.shape[1])[:literals_per_clause_colors]+x_filters.shape[1]
+                sampled_indexes = torch.cat([sampled_indexes_filters,sampled_indexes_colors])
+                print(sampled_indexes)
+                input('hipi')
                 # Slice the literals tensor 'x' along the second dimension (D) using the sampled indices.
                 sliced_literals = x[:, sampled_indexes, :]
                 print(f"Shape of original literals: {x.shape}")
@@ -223,6 +260,70 @@ class TMClauses(nn.Module):
         - torch.Tensor: The one-hot encoded tensor of shape (len(y), self.Cc).
         """
         return F.one_hot(y.squeeze().long(), num_classes=self.Cc)
+
+    def one_hot_numpy(self, y: np.ndarray) -> np.ndarray:
+        """
+        Converts a NumPy array of class labels to a one-hot encoded NumPy array.
+
+        Parameters:
+        - y (np.ndarray): A 1D or 2D array of class labels (integers). If 2D, it will be squeezed.
+
+        Returns:
+        - np.ndarray: The one-hot encoded array of shape (len(y), self.Cc), with dtype uint8.
+        """
+        y_squeezed = np.squeeze(y).astype(int)
+        num_samples = y_squeezed.shape[0]
+        one_hot_array = np.zeros((num_samples, self.Cc), dtype=np.uint8)
+        one_hot_array[np.arange(num_samples), y_squeezed] = 1
+        return one_hot_array
+
+    def run_logistic_regression(self, flattened_x: np.ndarray, one_hot_labels: np.ndarray, num_trials: int = 10, num_features_to_sample: int = 100):
+        """
+        Performs multi-class logistic regression on random feature subsets to find important features.
+
+        Parameters:
+        - flattened_x (np.ndarray): The feature matrix of shape (num_samples, num_features).
+        - one_hot_labels (np.ndarray): The one-hot encoded labels of shape (num_samples, num_classes).
+        - num_trials (int): The number of times to run the regression on different feature subsets.
+        - num_features_to_sample (int): The number of features to randomly sample in each trial.
+        """
+        print(f"\n--- Running Logistic Regression for feature analysis ({num_trials} trials) ---")
+        num_samples, num_total_features = flattened_x.shape
+        num_classes = one_hot_labels.shape[1]
+        
+        # Convert one-hot labels back to a 1D array of class indices for scikit-learn
+        y_indices = np.argmax(one_hot_labels, axis=1)
+
+        # This array will store the accumulated importance scores for each feature.
+        aggregate_coeffs = np.zeros((num_classes, num_total_features))
+
+        log_reg = LogisticRegression(multi_class='ovr', solver='lbfgs', C=0.1, max_iter=100, random_state=42)
+        
+        for i in range(num_trials):
+            print(f"  - Trial {i+1}/{num_trials}...", end='\r')
+            # Randomly sample 'num_features_to_sample' feature indices without replacement
+            feature_indices = np.random.choice(num_total_features, size=num_features_to_sample, replace=False)
+            
+            # Create a view of the data with only the sampled features
+            x_subset = flattened_x[:, feature_indices]
+            
+            try:
+                log_reg.fit(x_subset, y_indices)
+                # Calculate accuracy on the training subset
+                accuracy = log_reg.score(x_subset, y_indices)
+                # Calculate and display the 60th percentile of the absolute coefficient values
+                abs_coeffs = np.abs(log_reg.coef_).mean(axis=0)
+                quantile_60 = np.quantile(abs_coeffs, 0.60)
+                print(f"  - Trial {i+1}/{num_trials}... Accuracy: {accuracy:.2f}, 60th percentile of |coeffs|: {quantile_60:.4f}", end='\r')
+                relevant_features = np.where(abs_coeffs >= quantile_60)[0]
+                # Add the coefficients from this trial back to the aggregate matrix at their original positions
+                aggregate_coeffs[:, feature_indices[relevant_features]] += 1
+            except Exception as e:
+                print(f"\nAn error occurred during trial {i+1}: {e}")
+
+        print(f"\nLogistic Regression analysis complete. Aggregate coefficients shape: {aggregate_coeffs.shape}")
+        return aggregate_coeffs
+
     def mutual_information(self, x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
         """
         Calculates the mutual information I(X; Y) between two binary vectors.
